@@ -5,6 +5,7 @@ use niri_config::{Color, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupManager, Window};
 use smithay::output::{self, Output};
@@ -13,6 +14,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
+use smithay::wayland::background_effect::BackgroundEffectSurfaceCachedState;
 use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId, SurfaceData};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::{
@@ -28,6 +30,7 @@ use crate::layout::{
     LayoutElementRenderSnapshot, SizingMode,
 };
 use crate::niri_render_elements;
+use crate::protocols::kde_blur::{KdeBlurRegion, KdeBlurSurfaceCachedState};
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -523,6 +526,7 @@ impl Mapped {
             RenderCtx {
                 renderer,
                 target: RenderTarget::Screencast,
+                xray: None,
             },
             location,
             scale,
@@ -1292,6 +1296,45 @@ impl LayoutElement for Mapped {
 
     fn interactive_resize_data(&self) -> Option<InteractiveResizeData> {
         Some(self.interactive_resize.as_ref()?.data())
+    }
+
+    fn main_surface_geo(&self) -> Rectangle<i32, Logical> {
+        with_states(self.toplevel().wl_surface(), |states| {
+            let geo_loc = states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry
+                .unwrap_or_default()
+                .loc;
+
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            data.and_then(|d| d.lock().unwrap().view())
+                .map(|view| Rectangle {
+                    loc: view.offset - geo_loc,
+                    size: view.dst,
+                })
+        })
+        .unwrap_or_default()
+    }
+
+    fn blur_region(&self) -> Option<KdeBlurRegion> {
+        with_states(self.toplevel().wl_surface(), |states| {
+            let cached = &states.cached_state;
+
+            // Prefer ext-background-effect.
+            if cached.has::<BackgroundEffectSurfaceCachedState>() {
+                let mut guard = cached.get::<BackgroundEffectSurfaceCachedState>();
+                guard
+                    .current()
+                    .blur_region
+                    .clone()
+                    .map(KdeBlurRegion::Region)
+            } else {
+                let mut guard = cached.get::<KdeBlurSurfaceCachedState>();
+                guard.current().blur_region.clone()
+            }
+        })
     }
 
     fn on_commit(&mut self, commit_serial: Serial) {

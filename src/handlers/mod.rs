@@ -23,6 +23,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::wayland::background_effect::{self, ExtBackgroundEffectHandler};
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -61,8 +62,8 @@ use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 use smithay::{
-    delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_dmabuf,
-    delegate_drm_lease, delegate_ext_data_control, delegate_fractional_scale,
+    delegate_background_effect, delegate_cursor_shape, delegate_data_control, delegate_data_device,
+    delegate_dmabuf, delegate_drm_lease, delegate_ext_data_control, delegate_fractional_scale,
     delegate_idle_inhibit, delegate_idle_notify, delegate_input_method_manager,
     delegate_keyboard_shortcuts_inhibit, delegate_output, delegate_pointer_constraints,
     delegate_pointer_gestures, delegate_presentation, delegate_primary_selection,
@@ -80,6 +81,7 @@ use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
 };
 use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerState};
+use crate::protocols::kde_blur::KdeBlurHandler;
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
 use crate::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyManagerState};
@@ -90,7 +92,7 @@ use crate::protocols::virtual_pointer::{
 };
 use crate::utils::{output_size, send_scale_transform};
 use crate::{
-    delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
+    delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control, delegate_kde_blur,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
     delegate_virtual_pointer,
 };
@@ -715,6 +717,16 @@ impl DrmLeaseHandler for State {
 delegate_drm_lease!(State);
 
 delegate_viewporter!(State);
+
+impl ExtBackgroundEffectHandler for State {
+    fn capabilities(&self) -> background_effect::Capability {
+        background_effect::Capability::Blur
+    }
+}
+delegate_background_effect!(State);
+
+impl KdeBlurHandler for State {}
+delegate_kde_blur!(State);
 
 impl GammaControlHandler for State {
     fn gamma_control_manager_state(&mut self) -> &mut GammaControlManagerState {

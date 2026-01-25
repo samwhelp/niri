@@ -70,6 +70,7 @@ use smithay::utils::{
     ClockSource, IsAlive as _, Logical, Monotonic, Physical, Point, Rectangle, Scale, Size,
     Transform, SERIAL_COUNTER,
 };
+use smithay::wayland::background_effect::BackgroundEffectState;
 use smithay::wayland::compositor::{
     with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
     CompositorState, HookId, SurfaceData, TraversalAction,
@@ -144,6 +145,7 @@ use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
+use crate::protocols::kde_blur::KdeBlurState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
@@ -154,6 +156,7 @@ use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::xray::Xray;
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
     render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
@@ -277,6 +280,8 @@ pub struct Niri {
     pub screencopy_state: ScreencopyManagerState,
     pub output_management_state: OutputManagementManagerState,
     pub viewporter_state: ViewporterState,
+    pub background_effect_state: BackgroundEffectState,
+    pub kde_blur_state: KdeBlurState,
     pub xdg_foreign_state: XdgForeignState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
@@ -476,6 +481,7 @@ pub struct OutputState {
     /// Solid color buffer for the backdrop that we use instead of clearing to avoid damage
     /// tracking issues and make screenshots easier.
     pub backdrop_buffer: SolidColorBuffer,
+    pub xray: Xray,
     pub lock_render_state: LockRenderState,
     pub lock_surface: Option<LockSurface>,
     pub lock_color_buffer: SolidColorBuffer,
@@ -2029,6 +2035,33 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
+        // We'll be rendering Tiles and other stuff that needs their render elements up to date.
+        self.niri.update_render_elements(output);
+
+        self.backend.with_primary_renderer(|renderer| {
+            let mut ctx = RenderCtx {
+                // TODO: this means that on non-Output render targets, Output elements will show up
+                // in xray.
+                target: RenderTarget::Output,
+                renderer,
+                xray: None,
+            };
+
+            if let Some(output) = output {
+                self.niri.fill_xray_elements(ctx.r(), output);
+                let state = self.niri.output_state.get(output).unwrap();
+                ctx.xray = Some(&state.xray);
+
+                self.niri.layout.store_unmap_snapshot(ctx, window);
+
+                self.niri.clear_xray_elements(output);
+            } else {
+                self.niri.layout.store_unmap_snapshot(ctx, window);
+            }
+        });
+    }
+
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn set_dynamic_cast_target(&mut self, _target: CastTarget) {}
 
@@ -2285,6 +2318,8 @@ impl Niri {
         let screencopy_state =
             ScreencopyManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
         let viewporter_state = ViewporterState::new::<State>(&display_handle);
+        let background_effect_state = BackgroundEffectState::new::<State>(&display_handle);
+        let kde_blur_state = KdeBlurState::new::<State>(&display_handle);
         let xdg_foreign_state = XdgForeignState::new::<State>(&display_handle);
 
         let is_tty = matches!(backend, Backend::Tty(_));
@@ -2468,6 +2503,8 @@ impl Niri {
             output_management_state,
             screencopy_state,
             viewporter_state,
+            background_effect_state,
+            kde_blur_state,
             xdg_foreign_state,
             text_input_state,
             input_method_state,
@@ -2811,6 +2848,7 @@ impl Niri {
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
             frame_callback_sequence: 0,
             backdrop_buffer: SolidColorBuffer::new(size, backdrop_color),
+            xray: Xray::new(),
             lock_render_state,
             lock_surface: None,
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
@@ -3997,6 +4035,24 @@ impl Niri {
             if output.is_none_or(|output| out == output) {
                 let scale = Scale::from(out.current_scale().fractional_scale());
                 let transform = out.current_transform();
+                let mode = out.current_mode().unwrap();
+                let size = transform.transform_size(mode.size);
+
+                state.xray.workspaces.clear();
+                let mon = self.layout.monitor_for_output(out).unwrap();
+                for (ws, geo) in mon.workspaces_with_render_geo() {
+                    let bg_color = ws.render_background().color();
+                    state.xray.workspaces.push((geo, bg_color));
+                }
+                state.xray.backdrop_color = state.backdrop_buffer.color();
+                {
+                    let mut buffer = state.xray.background.borrow_mut();
+                    buffer.update_size(size, scale);
+                    buffer.update_blur_config(self.config.borrow().blur);
+                    let mut buffer = state.xray.backdrop.borrow_mut();
+                    buffer.update_size(size, scale);
+                    buffer.update_blur_config(self.config.borrow().blur);
+                }
 
                 if let Some(transition) = &mut state.screen_transition {
                     transition.update_render_elements(scale, transform);
@@ -4056,6 +4112,26 @@ impl Niri {
             }
         }
 
+        self.fill_xray_elements(ctx.as_gles(), output);
+
+        // Reborrow to shorten lifetime to be able to put in xray.
+        let mut ctx = ctx.r();
+        let state = self.output_state.get(output).unwrap();
+        ctx.xray = Some(&state.xray);
+
+        self.render_inner(ctx, output, include_pointer, push);
+
+        self.clear_xray_elements(output);
+    }
+
+    fn render_inner<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        include_pointer: bool,
+        push: &mut dyn FnMut(OutputRenderElements<R>),
+    ) {
+        let state = self.output_state.get(output).unwrap();
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
         let push = if self.debug_draw_opaque_regions {
@@ -4074,7 +4150,6 @@ impl Niri {
 
         // Next, the screen transition texture.
         {
-            let state = self.output_state.get(output).unwrap();
             if let Some(transition) = &state.screen_transition {
                 push(transition.render(ctx.target).into());
             }
@@ -4091,7 +4166,6 @@ impl Niri {
 
         // If the session is locked, draw the lock surface.
         if self.is_locked() {
-            let state = self.output_state.get(output).unwrap();
             if let Some(surface) = state.lock_surface.as_ref() {
                 push_elements_from_surface_tree(
                     ctx.renderer,
@@ -4119,7 +4193,6 @@ impl Niri {
         }
 
         // Prepare the background elements.
-        let state = self.output_state.get(output).unwrap();
         let backdrop = SolidColorRenderElement::from_buffer(
             &state.backdrop_buffer,
             (0., 0.),
@@ -4177,7 +4250,15 @@ impl Niri {
         }
         macro_rules! push_normal_from_layer {
             ($layer:expr, $backdrop:expr, $push:expr) => {{
-                self.render_layer_normal(ctx.r(), &layer_map, $layer, $backdrop, $push);
+                self.render_layer_normal(
+                    ctx.r(),
+                    &layer_map,
+                    $layer,
+                    Point::new(0., 0.),
+                    1.,
+                    $backdrop,
+                    $push,
+                );
             }};
             ($layer:expr, true) => {{
                 push_normal_from_layer!($layer, true, &mut |elem| push(elem.into()));
@@ -4244,8 +4325,19 @@ impl Niri {
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
-                push_normal_from_layer!(Layer::Bottom, process!(geo));
-                push_normal_from_layer!(Layer::Background, process!(geo));
+                let mut push_normal = |layer| {
+                    self.render_layer_normal(
+                        ctx.r(),
+                        &layer_map,
+                        layer,
+                        geo.loc,
+                        zoom,
+                        false,
+                        process!(geo),
+                    )
+                };
+                push_normal(Layer::Bottom);
+                push_normal(Layer::Background);
 
                 process!(geo)(ws.render_background());
             }
@@ -4258,6 +4350,72 @@ impl Niri {
         push_normal_from_layer!(Layer::Background, true);
 
         push(backdrop);
+    }
+
+    pub fn fill_xray_elements(&self, mut ctx: RenderCtx<GlesRenderer>, output: &Output) {
+        let _span = tracy_client::span!("Niri::fill_xray_elements");
+
+        // Make sure the xrayed elements themselves cannot use xray by mistake.
+        ctx.xray = None;
+
+        let state = self.output_state.get(output).unwrap();
+        let xray = &state.xray;
+        let layer_map = layer_map_for_output(output);
+
+        // FIXME: it would be cool to call this code on-demand. It's even relatively simple to do:
+        // move this function to after the render_inner() call, check if
+        // Rc::strong_count(&xray.background) > 1, and only then construct the elements. This way,
+        // only if something referenced the xray buffer will the elements get constructed.
+        //
+        // Unfortunately, currently this runs into an important limitation: offscreens are rendered
+        // immediately deep inside render_inner(), and when they are, they already need the xray
+        // elements filled.
+        //
+        // Perhaps in the future when offscreen rendering becomes on-demand, this optimization will
+        // be possible.
+
+        let mut buffer = xray.background.borrow_mut();
+        {
+            let elements = buffer.elements();
+            elements.clear();
+            self.render_layer_normal(
+                ctx.r(),
+                &layer_map,
+                Layer::Background,
+                Point::new(0., 0.),
+                1.,
+                false,
+                &mut |elem| elements.push(elem.into()),
+            );
+            // Avoid unused capacity remaining forever.
+            elements.shrink_to_fit();
+        }
+
+        let mut buffer = xray.backdrop.borrow_mut();
+        {
+            let elements = buffer.elements();
+            elements.clear();
+            self.render_layer_normal(
+                ctx.r(),
+                &layer_map,
+                Layer::Background,
+                Point::new(0., 0.),
+                1.,
+                true,
+                &mut |elem| elements.push(elem.into()),
+            );
+            // Avoid unused capacity remaining forever.
+            elements.shrink_to_fit();
+        }
+    }
+
+    pub fn clear_xray_elements(&self, output: &Output) {
+        let state = self.output_state.get(output).unwrap();
+        let xray = &state.xray;
+
+        // Clear the xray elements after all rendering that could use them did so.
+        xray.background.borrow_mut().elements().clear();
+        xray.backdrop.borrow_mut().elements().clear();
     }
 
     fn layers_in_render_order<'a>(
@@ -4279,16 +4437,21 @@ impl Niri {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_layer_normal<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
         layer_map: &LayerMap,
         layer: Layer,
+        pos_in_backdrop: Point<f64, Logical>,
+        zoom: f64,
         for_backdrop: bool,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
-            mapped.render_normal(ctx.r(), geo.loc.to_f64(), push);
+            let loc = geo.loc.to_f64();
+            let pos_in_backdrop = pos_in_backdrop + loc.upscale(zoom);
+            mapped.render_normal(ctx.r(), loc, pos_in_backdrop, zoom, push);
         }
     }
 
@@ -4928,6 +5091,7 @@ impl Niri {
                         let ctx = RenderCtx {
                             renderer,
                             target: RenderTarget::ScreenCapture,
+                            xray: None,
                         };
                         self.render_to_vec(ctx, output, true)
                     });
@@ -4995,6 +5159,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            xray: None,
         };
         let elements = self.render_to_vec(ctx, output, screencopy.overlay_cursor());
 
@@ -5120,7 +5285,11 @@ impl Niri {
                 RenderTarget::ScreenCapture,
             ];
             let screenshot = targets.map(|target| {
-                let ctx = RenderCtx { renderer, target };
+                let ctx = RenderCtx {
+                    renderer,
+                    target,
+                    xray: None,
+                };
                 let elements = self.render_to_vec(ctx, &output, false);
                 let elements = elements.iter().rev();
 
@@ -5201,6 +5370,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            xray: None,
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
         let elements = elements.iter().rev();
@@ -5255,6 +5425,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            xray: None,
         };
         mapped.render(
             ctx,
@@ -5419,6 +5590,7 @@ impl Niri {
         let ctx = RenderCtx {
             renderer,
             target: RenderTarget::ScreenCapture,
+            xray: None,
         };
         let elements = self.render_to_vec(ctx, &output, include_pointer);
         let elements = elements.iter().rev();
@@ -5893,7 +6065,11 @@ impl Niri {
                     RenderTarget::ScreenCapture,
                 ];
                 let textures = targets.map(|target| {
-                    let ctx = RenderCtx { renderer, target };
+                    let ctx = RenderCtx {
+                        renderer,
+                        target,
+                        xray: None,
+                    };
                     let elements = self.render_to_vec(ctx, &output, false);
                     let elements = elements.iter().rev();
 

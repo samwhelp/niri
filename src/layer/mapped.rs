@@ -2,19 +2,25 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{Config, LayerRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::desktop::{LayerSurface, PopupManager};
-use smithay::utils::{Logical, Point, Scale, Size};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use smithay::wayland::background_effect::BackgroundEffectSurfaceCachedState;
+use smithay::wayland::compositor::{with_states, RectangleKind};
 use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
 use crate::layout::shadow::Shadow;
 use crate::niri_render_elements;
+use crate::protocols::kde_blur::{KdeBlurRegion, KdeBlurSurfaceCachedState};
+use crate::render_helpers::background_effect::BackgroundEffectElement;
+use crate::render_helpers::blur::BlurElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
-use crate::render_helpers::RenderCtx;
+use crate::render_helpers::{background_effect, RenderCtx};
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
 
 #[derive(Debug)]
@@ -31,6 +37,8 @@ pub struct MappedLayer {
     /// The shadow around the surface.
     shadow: Shadow,
 
+    blur: BlurElement,
+
     /// The view size for the layer surface's output.
     view_size: Size<f64, Logical>,
 
@@ -46,6 +54,7 @@ niri_render_elements! {
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         Shadow = ShadowRenderElement,
+        BackgroundEffect = BackgroundEffectElement,
     }
 }
 
@@ -70,6 +79,7 @@ impl MappedLayer {
             view_size,
             scale,
             shadow: Shadow::new(shadow_config),
+            blur: BlurElement::new(),
             clock,
         }
     }
@@ -80,6 +90,8 @@ impl MappedLayer {
         shadow_config.on = false;
         shadow_config.merge_with(&self.rules.shadow);
         self.shadow.update_config(shadow_config);
+
+        self.blur.update_config(config.blur);
     }
 
     pub fn update_shaders(&mut self) {
@@ -103,6 +115,8 @@ impl MappedLayer {
         // FIXME: is_active based on keyboard focus?
         self.shadow
             .update_render_elements(size, true, radius, self.scale, 1.);
+
+        self.blur.update_render_elements(self.scale, radius);
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -157,13 +171,16 @@ impl MappedLayer {
 
     pub fn render_normal<R: NiriRenderer>(
         &self,
-        ctx: RenderCtx<R>,
+        mut ctx: RenderCtx<R>,
         location: Point<f64, Logical>,
+        mut pos_in_backdrop: Point<f64, Logical>,
+        zoom: f64,
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         let scale = Scale::from(self.scale);
         let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
         let location = location + self.bob_offset();
+        pos_in_backdrop += self.bob_offset().upscale(zoom);
 
         if ctx.target.should_block_out(self.rules.block_out_from) {
             // Round to physical pixels.
@@ -196,6 +213,74 @@ impl MappedLayer {
         let location = location.to_physical_precise_round(scale).to_logical(scale);
         self.shadow
             .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+
+        let effect = self.rules.background_effect;
+        let area = Rectangle::new(location, self.block_out_buffer.size());
+        let mut blur = effect.blur == Some(true);
+        // Effects not requested by the surface itself are drawn to match the geometry.
+        let mut clip_to_geometry = true;
+
+        // FIXME: support blur regions on subsurfaces in addition to the main surface.
+        let blur_geometry = if let Some(region) = self.blur_region() {
+            let main_surface_geo = self.main_surface_geo();
+            let region = match region {
+                KdeBlurRegion::WholeSurface => Some(main_surface_geo),
+                KdeBlurRegion::Region(region) => {
+                    // FIXME: support regions with more than one rect.
+                    let rect = region.rects.iter().copied().find_map(|(kind, rect)| {
+                        matches!(kind, RectangleKind::Add).then_some(rect)
+                    });
+                    rect.and_then(|rect| {
+                        rect.intersection(Rectangle::from_size(main_surface_geo.size))
+                    })
+                    .map(|mut rect| {
+                        rect.loc += main_surface_geo.loc;
+                        rect
+                    })
+                }
+            };
+
+            if let Some(region) = region {
+                // If the surface itself requests the effects, apply different defaults.
+                blur = effect.blur != Some(false);
+                clip_to_geometry = false;
+
+                trace!("rendering layer ext/kde blur with region={region:?}");
+                let mut region = region.to_f64();
+                region.loc += area.loc;
+                Some(region)
+            } else {
+                None
+            }
+        } else {
+            Some(area)
+        };
+
+        if let Some(geometry) = blur_geometry {
+            pos_in_backdrop += (geometry.loc - area.loc).upscale(zoom);
+            // TODO: damage on parameter change
+            let mut params = background_effect::Parameters {
+                geometry,
+                window_geometry: area,
+                pos_in_backdrop,
+                zoom,
+                corner_radius: self.rules.geometry_corner_radius.unwrap_or_default(),
+                scale: self.scale as f32,
+                xray: effect.xray == Some(true),
+                blur,
+                noise: effect.noise,
+                saturation: effect.saturation,
+                clip_to_geometry,
+            };
+            // If we have some background effect but xray wasn't explicitly set, default it to true
+            // since it's cheaper.
+            if params.is_visible() && effect.xray.is_none() {
+                params.xray = true;
+            }
+            background_effect::render(ctx.as_gles(), params, &self.blur, &mut |elem| {
+                push(elem.into())
+            });
+        }
     }
 
     pub fn render_popups<R: NiriRenderer>(
@@ -230,5 +315,36 @@ impl MappedLayer {
                 &mut |elem| push(elem.into()),
             );
         }
+    }
+
+    fn main_surface_geo(&self) -> Rectangle<i32, Logical> {
+        with_states(self.surface.wl_surface(), |states| {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            data.and_then(|d| d.lock().unwrap().view())
+                .map(|view| Rectangle {
+                    loc: view.offset,
+                    size: view.dst,
+                })
+        })
+        .unwrap_or_default()
+    }
+
+    fn blur_region(&self) -> Option<KdeBlurRegion> {
+        with_states(self.surface.wl_surface(), |states| {
+            let cached = &states.cached_state;
+
+            // Prefer ext-background-effect.
+            if cached.has::<BackgroundEffectSurfaceCachedState>() {
+                let mut guard = cached.get::<BackgroundEffectSurfaceCachedState>();
+                guard
+                    .current()
+                    .blur_region
+                    .clone()
+                    .map(KdeBlurRegion::Region)
+            } else {
+                let mut guard = cached.get::<KdeBlurSurfaceCachedState>();
+                guard.current().blur_region.clone()
+            }
+        })
     }
 }

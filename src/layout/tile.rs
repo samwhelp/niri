@@ -7,6 +7,7 @@ use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use smithay::wayland::compositor::RectangleKind;
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
@@ -18,6 +19,9 @@ use super::{
 use crate::animation::{Animation, Clock};
 use crate::layout::SizingMode;
 use crate::niri_render_elements;
+use crate::protocols::kde_blur::KdeBlurRegion;
+use crate::render_helpers::background_effect::{self, BackgroundEffectElement};
+use crate::render_helpers::blur::BlurElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
@@ -56,6 +60,8 @@ pub struct Tile<W: LayoutElement> {
 
     /// The black backdrop for fullscreen windows.
     fullscreen_backdrop: SolidColorBuffer,
+
+    blur: BlurElement,
 
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
@@ -130,6 +136,7 @@ niri_render_elements! {
         ClippedSurface = ClippedSurfaceRenderElement<R>,
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
+        BackgroundEffect = BackgroundEffectElement,
     }
 }
 
@@ -192,6 +199,7 @@ impl<W: LayoutElement> Tile<W> {
             shadow: Shadow::new(shadow_config),
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
+            blur: BlurElement::new(),
             restore_to_floating: false,
             floating_window_size: None,
             floating_pos: None,
@@ -248,6 +256,8 @@ impl<W: LayoutElement> Tile<W> {
 
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
+
+        self.blur.update_config(self.options.blur);
     }
 
     pub fn update_shaders(&mut self) {
@@ -504,6 +514,8 @@ impl<W: LayoutElement> Tile<W> {
             self.scale,
             1. - expanded_progress as f32,
         );
+
+        self.blur.update_render_elements(self.scale, radius);
 
         let draw_focus_ring_with_background = if self.border.is_off() {
             draw_border_with_background
@@ -1011,6 +1023,8 @@ impl<W: LayoutElement> Tile<W> {
         &self,
         mut ctx: RenderCtx<R>,
         location: Point<f64, Logical>,
+        mut pos_in_backdrop: Point<f64, Logical>,
+        zoom: f64,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement<R>),
     ) {
@@ -1039,11 +1053,13 @@ impl<W: LayoutElement> Tile<W> {
         // This isn't to say that adding it here is perfect; indeed, it kind of breaks view_rect
         // passed to update_render_elements(). But, it works well enough for what it is.
         let location = location + self.bob_offset();
+        pos_in_backdrop += self.bob_offset().upscale(zoom);
 
         let window_loc = self.window_loc();
         let window_size = self.window_size();
         let animated_window_size = self.animated_window_size();
         let window_render_loc = location + window_loc;
+        pos_in_backdrop += window_loc.upscale(zoom);
         let area = Rectangle::new(window_render_loc, animated_window_size);
 
         let rules = self.window.rules();
@@ -1273,12 +1289,85 @@ impl<W: LayoutElement> Tile<W> {
             self.shadow
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }
+
+        let effect = rules.background_effect;
+        let corner_radius = rules
+            .geometry_corner_radius
+            .unwrap_or_default()
+            .scaled_by(1. - expanded_progress as f32);
+        let mut blur = effect.blur == Some(true);
+        // Effects not requested by the surface itself are drawn to match the geometry.
+        let mut clip_to_geometry = true;
+
+        // FIXME: support blur regions on subsurfaces in addition to the main surface.
+        let blur_geometry = if let Some(region) = self.window.blur_region() {
+            let main_surface_geo = self.window.main_surface_geo();
+            let region = match region {
+                KdeBlurRegion::WholeSurface => Some(main_surface_geo),
+                KdeBlurRegion::Region(region) => {
+                    // FIXME: support regions with more than one rect.
+                    let rect = region.rects.iter().copied().find_map(|(kind, rect)| {
+                        matches!(kind, RectangleKind::Add).then_some(rect)
+                    });
+                    rect.and_then(|rect| {
+                        rect.intersection(Rectangle::from_size(main_surface_geo.size))
+                    })
+                    .map(|mut rect| {
+                        rect.loc += main_surface_geo.loc;
+                        rect
+                    })
+                }
+            };
+
+            if let Some(region) = region {
+                // If the surface itself requests the effects, apply different defaults.
+                blur = effect.blur != Some(false);
+                clip_to_geometry = rules.clip_to_geometry == Some(true);
+
+                trace!("rendering toplevel ext/kde blur with region={region:?}");
+                let mut region = region.to_f64();
+                region.loc += area.loc;
+                Some(region)
+            } else {
+                None
+            }
+        } else {
+            Some(area)
+        };
+
+        if let Some(geometry) = blur_geometry {
+            pos_in_backdrop += (geometry.loc - area.loc).upscale(zoom);
+            // TODO: damage on parameter change
+            let mut params = background_effect::Parameters {
+                geometry,
+                window_geometry: area,
+                pos_in_backdrop,
+                zoom,
+                corner_radius,
+                scale: self.scale as f32,
+                xray: effect.xray == Some(true),
+                blur,
+                noise: effect.noise,
+                saturation: effect.saturation,
+                clip_to_geometry,
+            };
+            // If we have some background effect but xray wasn't explicitly set, default it to true
+            // since it's cheaper.
+            if params.is_visible() && effect.xray.is_none() {
+                params.xray = true;
+            }
+            background_effect::render(ctx.as_gles(), params, &self.blur, &mut |elem| {
+                push(elem.into())
+            });
+        }
     }
 
     pub fn render<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
         location: Point<f64, Logical>,
+        pos_in_backdrop: Point<f64, Logical>,
+        zoom: f64,
         focus_ring: bool,
         push: &mut dyn FnMut(TileRenderElement<R>),
     ) {
@@ -1297,9 +1386,14 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
-            self.render_inner(ctx.r(), Point::from((0., 0.)), focus_ring, &mut |elem| {
-                elements.push(elem)
-            });
+            self.render_inner(
+                ctx.r(),
+                Point::new(0., 0.),
+                pos_in_backdrop,
+                zoom,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
             match open.render(
                 ctx.renderer,
                 &elements,
@@ -1320,9 +1414,14 @@ impl<W: LayoutElement> Tile<W> {
         } else if let Some(alpha) = &self.alpha_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
-            self.render_inner(ctx.r(), Point::from((0., 0.)), focus_ring, &mut |elem| {
-                elements.push(elem)
-            });
+            self.render_inner(
+                ctx.r(),
+                Point::new(0., 0.),
+                pos_in_backdrop,
+                zoom,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
                 Ok((elem, _sync, data)) => {
                     let offset = elem.offset();
@@ -1339,28 +1438,47 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if !pushed {
-            self.render_inner(ctx, location, focus_ring, &mut |elem| push(elem));
+            self.render_inner(
+                ctx,
+                location,
+                pos_in_backdrop,
+                zoom,
+                focus_ring,
+                &mut |elem| push(elem),
+            );
         }
     }
 
-    pub fn store_unmap_snapshot_if_empty(&mut self, renderer: &mut GlesRenderer) {
+    pub fn store_unmap_snapshot_if_empty(
+        &mut self,
+        ctx: RenderCtx<GlesRenderer>,
+        pos_in_backdrop: Point<f64, Logical>,
+        zoom: f64,
+    ) {
         if self.unmap_snapshot.is_some() {
             return;
         }
 
-        self.unmap_snapshot = Some(self.render_snapshot(renderer));
+        self.unmap_snapshot = Some(self.render_snapshot(ctx, pos_in_backdrop, zoom));
     }
 
-    fn render_snapshot(&self, renderer: &mut GlesRenderer) -> TileRenderSnapshot {
+    fn render_snapshot(
+        &self,
+        mut ctx: RenderCtx<GlesRenderer>,
+        pos_in_backdrop: Point<f64, Logical>,
+        zoom: f64,
+    ) -> TileRenderSnapshot {
         let _span = tracy_client::span!("Tile::render_snapshot");
 
         let mut contents = Vec::new();
         self.render(
             RenderCtx {
-                renderer,
                 target: RenderTarget::Output,
+                ..ctx.r()
             },
             Point::from((0., 0.)),
+            pos_in_backdrop,
+            zoom,
             false,
             &mut |elem| contents.push(elem),
         );
@@ -1369,10 +1487,12 @@ impl<W: LayoutElement> Tile<W> {
         let mut blocked_out_contents = Vec::new();
         self.render(
             RenderCtx {
-                renderer,
                 target: RenderTarget::Screencast,
+                ..ctx.r()
             },
             Point::from((0., 0.)),
+            pos_in_backdrop,
+            zoom,
             false,
             &mut |elem| blocked_out_contents.push(elem),
         );
